@@ -1,131 +1,108 @@
-"""交互式诊断 Agent - 用户描述训练问题，Agent 自主排查并给出解决方案
+"""交互式诊断 Agent v3 - ReAct 推理 + 策略记忆 + 目标驱动
 
-核心流程:
-  用户描述问题 → Agent 理解问题 → 拆解排查步骤 → 逐步执行 → 诊断结论 + 修复建议
-
-支持的问题类型:
-  - "模型过拟合严重"
-  - "某个类别的召回率特别低"
-  - "帮我优化到 F1 > 0.85"
-  - "分析一下哪些特征最重要"
-  - "数据量是否足够"
-  - "帮我对比不同模型"
+核心升级:
+1. ReAct 框架: Thought → Action → Observation → Reflection 循环
+2. 策略记忆: 追踪什么有效什么失败，避免重复
+3. 自动诊断: diagnose_current_state 一键检测所有问题
+4. 目标驱动: 设定 F1 > 0.85 等目标，Agent 自主迭代直到达成
 """
 
 import json
+import re
 from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.markdown import Markdown
 from rich.prompt import Prompt
-from rich.columns import Columns
 
 from .dataset import DatasetManager, DATASET_INFO
 from .trainer import TrainingEngine
 from .deep_trainer import DeepTrainingEngine
 from .tools.definitions import OPENAI_TOOLS
 from .tools.executor import ToolExecutor
+from .strategy import StrategyMemory
 from .visualizer import generate_all_plots
 
 console = Console()
 
-INTERACTIVE_SYSTEM_PROMPT = """你是一个专业的机器学习训练诊断 Agent。用户会描述他们遇到的训练问题，你需要：
+# ReAct 风格系统 Prompt 模板
+SYSTEM_PROMPT_TEMPLATE = """你是一个专业的机器学习训练诊断 Agent，使用 ReAct (Reasoning + Acting) 框架进行系统化推理。
 
-## 核心能力
+## 推理框架
 
-1. **理解问题**: 准确理解用户描述的训练问题本质
-2. **拆解排查步骤**: 将问题分解为可执行的排查步骤
-3. **逐步执行**: 调用工具收集信息，逐步排查
-4. **诊断结论**: 根据排查结果给出原因分析和解决方案
+你的每一步决策都必须遵循结构化思考：
 
-## 诊断流程
+1. **Thought (思考)**: 分析当前状况、存在的问题、下一步的理由
+2. **Hypothesis (假设)**: 明确你的优化假设 — "我认为 X 是因为 Y，如果我做 Z 应该会改善"
+3. **Action (行动)**: 调用工具执行
+4. **Reflection (反思)**: 结果是否符合假设？学到了什么？
 
-对于每个用户问题，你应该：
+## 诊断阶段
 
-1. 先用一句话总结你理解的问题
-2. 列出你的排查计划（分步骤，通常 3-5 步）
-3. 按步骤调用工具收集信息
-4. 每步之后简要分析中间结果
-5. 最终给出：
-   - **根因分析**: 问题产生的原因
-   - **解决方案**: 具体的修复建议（包括参数）
-   - **验证方法**: 如何验证问题已解决
+### Phase 1: 情报收集 (Reconnaissance)
+- 调用 get_data_summary 了解数据
+- 如果用户描述了问题，确认理解
+- 列出初步假设
 
-## 你拥有的工具
+### Phase 2: 基线建立 (Baseline)
+- 训练 1-2 个基线模型
+- 调用 diagnose_current_state 获取自动诊断报告
+- 确定主要问题（过拟合？欠拟合？类别不平衡？）
+
+### Phase 3: 假设驱动优化 (Hypothesis-Driven Iteration)
+每次优化必须说明：
+- **假设**: "我认为 [问题] 的原因是 [分析]"
+- **实验**: "我将 [具体操作] 来验证"
+- **预期**: "如果假设正确，应该看到 [预期变化]"
+训练后对比实际 vs 预期，更新认知。
+
+### Phase 4: 收敛与总结 (Convergence)
+- 调用 generate_report 生成可视化
+- 调用 finish 输出完整总结
+
+## 工具列表
+
+### 诊断
+- diagnose_current_state: 一键自动检测所有问题（过拟合/欠拟合/类别不平衡/瓶颈/噪声标签）
 
 ### 传统 ML
-- get_data_summary: 了解数据集基本信息
-- get_available_models: 查看可用 sklearn 模型和参数
-- run_training: 训练 sklearn 模型
-- run_cross_validation: 交叉验证
+- run_training: sklearn 模型 (RF/GB/LR/SVM/MLP/AdaBoost)
+- run_cross_validation: K 折交叉验证
 
-### 深度学习 (PyTorch)
-- run_deep_training: 训练自定义深度神经网络，可配置网络结构/优化器/学习率调度/早停，返回完整 epoch 级别训练日志
-- get_deep_training_history: 查看深度学习训练历史
+### 深度学习
+- run_deep_training: PyTorch DNN (可配网络结构/优化器/scheduler/早停)
 
-### 分析诊断
-- analyze_feature_importance: 特征重要性分析
-- analyze_learning_curve: 学习曲线分析
-- analyze_bad_cases: 分析错误样本
-- compare_iterations: 对比两次训练（sklearn 和深度学习结果统一编号，可以跨模型对比）
+### 分析
+- analyze_feature_importance / analyze_learning_curve / analyze_bad_cases
+- compare_iterations / get_training_history / get_deep_training_history
 
 ### 数据操作
-- clean_noisy_data: 清洗噪声数据
-- augment_data: 数据增强（过采样/加噪声）
+- clean_noisy_data / augment_data
 
 ### 报告
-- generate_report: 生成可视化报告（含深度学习 loss 曲线）
-- finish: 输出最终结论
+- generate_report / finish
 
-## 常见问题排查模板
+## 策略记忆
+{strategy_context}
 
-### 过拟合
-1. get_data_summary → 判断数据量
-2. run_training(默认参数) → 看 overfit_gap
-3. analyze_learning_curve → 判断是数据量不足还是模型过复杂
-4. run_training(加正则化) → 验证
+## 决策红线
 
-### 某类别表现差
-1. get_data_summary → 看类别分布
-2. run_training → 看 per-class report
-3. analyze_bad_cases → 该类别的错误模式
-4. 调整策略
-
-### 性能瓶颈
-1. 多模型对比 → 找最佳模型
-2. analyze_feature_importance → 看特征质量
-3. 调参优化
-4. run_cross_validation → 验证稳定性
-
-### 数据量是否足够
-1. analyze_learning_curve → 看曲线是否收敛
-
-### 需要更强模型
-1. 先用 sklearn 模型建基线
-2. run_deep_training(preset="medium") → 深度网络
-3. 根据 loss 曲线调整: 过拟合→加dropout/减网络、欠拟合→加宽加深
-4. 尝试不同 optimizer/scheduler
-
-### 类别不平衡
-1. get_data_summary → 看分布
-2. augment_data(method="oversample") → 过采样少数类
-3. 重新训练对比
+1. **永远不要重复已失败的配置** — 查看策略记忆中的 ❌ 项
+2. **每次调参必须有假设** — 不能盲目搜索
+3. **连续 3 次无改进 → 切换方向** — 换模型类型或数据策略
+4. **善用 diagnose_current_state** — 它能一次检测多个问题
 
 ## 输出要求
 
-- 使用中文回复
-- 每个排查步骤前说明理由
-- 善用 markdown 格式
-- 诊断过程中如果发现新问题，主动指出
-- 在诊断结束时调用 generate_report 生成可视化报告
-- 然后调用 finish 总结"""
+- 中文回复
+- 使用 markdown 格式
+- 诊断过程中发现新问题要主动指出"""
 
 
 class InteractiveAgent:
-    """交互式诊断 Agent - 多轮对话"""
+    """交互式诊断 Agent v3"""
 
-    # 上下文窗口控制：超过此消息数则压缩历史
     MAX_MESSAGES = 60
 
     def __init__(
@@ -135,6 +112,7 @@ class InteractiveAgent:
         model: str = "qwen3.5-plus",
         api_key: str = "",
         base_url: str = "",
+        goal: str | None = None,
     ):
         self.dataset_name = dataset_name
         self.dataset = DatasetManager(dataset_name=dataset_name)
@@ -146,21 +124,93 @@ class InteractiveAgent:
         self.api_key = api_key
         self.base_url = base_url
         self.client = OpenAI(api_key=api_key, base_url=base_url)
-        self.messages: list[dict] = [
-            {"role": "system", "content": INTERACTIVE_SYSTEM_PROMPT},
+
+        # v3 新增
+        self.strategy = StrategyMemory()
+        self.goal = self._parse_goal(goal) if goal else None
+
+        # 初始化消息（system prompt 在每次调用前动态渲染）
+        self.messages: list[dict] = []
+        self._rebuild_system_prompt()
+
+    def _rebuild_system_prompt(self):
+        """用策略记忆动态渲染 system prompt"""
+        rendered = SYSTEM_PROMPT_TEMPLATE.replace(
+            "{strategy_context}",
+            self.strategy.to_context_string(),
+        )
+        if self.goal:
+            rendered += f"\n\n## 当前目标\n**{self.goal['metric'].upper()} > {self.goal['target']}**\n"
+            rendered += f"已尝试 {self.goal['attempts_used']}/{self.goal['max_attempts']} 次\n"
+            rendered += f"当前最佳: {self.strategy.current_best_f1:.4f}\n"
+            if self.strategy.current_best_f1 >= self.goal["target"]:
+                rendered += "✅ **目标已达成！** 请调用 finish 总结。\n"
+            else:
+                gap = self.goal["target"] - self.strategy.current_best_f1
+                rendered += f"距目标还差: {gap:.4f}\n"
+
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = rendered
+        else:
+            self.messages.insert(0, {"role": "system", "content": rendered})
+
+    def _parse_goal(self, goal_str: str) -> dict | None:
+        """解析目标字符串，如 'F1>0.85' 或 'accuracy>=0.90'"""
+        if not goal_str:
+            return None
+        # 匹配 "F1 > 0.85", "f1>0.85", "accuracy >= 0.9" 等
+        match = re.match(r"(f1|accuracy|acc)\s*[>>=]+\s*([\d.]+)", goal_str.strip(), re.IGNORECASE)
+        if match:
+            metric = match.group(1).lower()
+            if metric == "acc":
+                metric = "accuracy"
+            target = float(match.group(2))
+            return {"metric": metric, "target": target, "max_attempts": 20, "attempts_used": 0}
+        return None
+
+    def _try_parse_goal_from_input(self, text: str) -> bool:
+        """尝试从用户输入中检测目标"""
+        patterns = [
+            r"(?:优化到|达到|目标|target)\s*(?:f1|F1)\s*[>>=]*\s*([\d.]+)",
+            r"(?:f1|F1)\s*[>>=]+\s*([\d.]+)",
+            r"(?:accuracy|准确率)\s*[>>=]+\s*([\d.]+)",
         ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                target = float(match.group(1))
+                metric = "accuracy" if "accuracy" in pattern or "准确率" in pattern else "f1"
+                self.goal = {"metric": metric, "target": target, "max_attempts": 20, "attempts_used": 0}
+                console.print(Panel(
+                    f"[bold yellow]目标模式激活: {metric.upper()} > {target}[/bold yellow]\n"
+                    f"Agent 将自主迭代直到达成目标或用尽 {self.goal['max_attempts']} 次尝试。",
+                    title="🎯 Goal Mode",
+                ))
+                return True
+        return False
+
+    def _check_goal(self) -> bool:
+        """检查目标是否达成"""
+        if not self.goal:
+            return False
+        if self.goal["metric"] == "f1":
+            return self.strategy.current_best_f1 >= self.goal["target"]
+        elif self.goal["metric"] == "accuracy":
+            best = self.engine.get_best_result()
+            return best and best.accuracy >= self.goal["target"]
+        return False
 
     def _switch_dataset(self, name: str):
-        """切换数据集并重置训练状态"""
         self.dataset_name = name
         self.dataset = DatasetManager(dataset_name=name)
         self.engine = TrainingEngine()
         self.deep_engine = DeepTrainingEngine()
         self.executor = ToolExecutor(self.dataset, self.engine, self.deep_engine)
-        # 保留对话历史但添加切换通知
+        self.strategy = StrategyMemory()
+        self._rebuild_system_prompt()
         self.messages.append({
             "role": "user",
-            "content": f"[系统通知] 数据集已切换为 {name} ({DATASET_INFO[name]['name']})。之前的训练记录已清空，请基于新数据集继续。",
+            "content": f"[系统通知] 数据集已切换为 {name} ({DATASET_INFO[name]['name']})。训练记录和策略记忆已清空。",
         })
         console.print(Panel(
             f"[bold green]数据集已切换为: {name} ({DATASET_INFO[name]['name']})[/bold green]\n"
@@ -169,28 +219,18 @@ class InteractiveAgent:
         ))
 
     def _compress_history(self):
-        """当对话过长时压缩历史，保留系统消息和最近的对话"""
         if len(self.messages) <= self.MAX_MESSAGES:
             return
-
-        # 保留 system 消息 + 最近 30 条
         system_msgs = [m for m in self.messages if isinstance(m, dict) and m.get("role") == "system"]
         recent = self.messages[-30:]
-
-        # 生成历史摘要
-        n_removed = len(self.messages) - len(system_msgs) - len(recent)
         summary = {
             "role": "user",
-            "content": f"[系统通知] 之前的 {n_removed} 条对话历史已压缩。"
-                       f"当前训练历史: {len(self.engine.history)} 轮迭代，"
-                       f"最佳 F1: {self.engine.get_best_result().f1:.4f if self.engine.get_best_result() else 'N/A'}",
+            "content": f"[系统通知] 对话已压缩。策略记忆摘要:\n{self.strategy.to_context_string()}",
         }
-
         self.messages = system_msgs + [summary] + recent
-        console.print("[dim]对话历史已压缩以节省上下文空间[/dim]")
+        console.print("[dim]对话历史已压缩[/dim]")
 
     def run(self):
-        """交互式主循环"""
         self._show_welcome()
 
         while True:
@@ -198,7 +238,6 @@ class InteractiveAgent:
             user_input = Prompt.ask("[bold cyan]你的问题[/bold cyan]")
             cmd = user_input.strip().lower()
 
-            # 命令处理
             if cmd in ("quit", "exit", "q"):
                 if self.engine.history:
                     self._generate_final_report()
@@ -208,15 +247,15 @@ class InteractiveAgent:
             if cmd == "report":
                 self._generate_final_report()
                 continue
-
             if cmd == "history":
                 self._show_history()
                 continue
-
             if cmd == "help":
                 self._show_help()
                 continue
-
+            if cmd == "strategy":
+                self._show_strategy()
+                continue
             if cmd.startswith("dataset "):
                 name = cmd.split(" ", 1)[1].strip()
                 if name == "list":
@@ -227,116 +266,39 @@ class InteractiveAgent:
                     console.print(f"[red]未知数据集: {name}[/red]")
                     self._show_datasets()
                 continue
-
             if cmd == "reset":
                 self.engine = TrainingEngine()
                 self.deep_engine = DeepTrainingEngine()
                 self.executor = ToolExecutor(self.dataset, self.engine, self.deep_engine)
-                console.print("[yellow]训练历史已清空[/yellow]")
+                self.strategy = StrategyMemory()
+                self.goal = None
+                self._rebuild_system_prompt()
+                console.print("[yellow]训练历史和策略记忆已清空[/yellow]")
                 continue
 
             if not cmd:
                 continue
 
-            # 重置 finish 状态
+            # 检测目标模式
+            self._try_parse_goal_from_input(user_input)
+
             self.executor._finished = False
-
-            # 压缩过长历史
             self._compress_history()
+            self._rebuild_system_prompt()
 
-            # 添加用户消息
             self.messages.append({"role": "user", "content": user_input})
-
-            # Agent 排查循环
             self._agent_loop()
 
-    def _show_welcome(self):
-        """显示欢迎界面"""
-        ds_info = DATASET_INFO[self.dataset_name]
-        examples = [
-            "帮我训练一个分类模型并优化到最佳",
-            "模型过拟合严重怎么办",
-            "为什么某些类别的召回率特别低",
-            "帮我分析哪些特征最重要",
-            "数据量够不够，需不需要更多数据",
-            "帮我对比所有模型的表现",
-        ]
-        example_text = "\n".join(f"  [yellow]>[/yellow] {e}" for e in examples)
-
-        console.print(Panel(
-            f"[bold green]交互式训练诊断 Agent[/bold green]\n"
-            f"数据集: [cyan]{self.dataset_name}[/cyan] - {ds_info['name']}\n"
-            f"  {ds_info['description']}\n"
-            f"LLM: {self.model}\n\n"
-            f"[bold]示例问题:[/bold]\n{example_text}\n\n"
-            f"[dim]命令: quit 退出 | report 生成报告 | history 查看历史 | "
-            f"dataset <name> 切换数据集 | dataset list 列出数据集 | reset 清空训练 | help 帮助[/dim]",
-            title="🩺 Training Diagnostics Agent",
-            border_style="green",
-        ))
-
-    def _show_help(self):
-        console.print(Panel(
-            "[bold]可用命令:[/bold]\n"
-            "  [cyan]quit[/cyan]         退出程序\n"
-            "  [cyan]report[/cyan]       生成可视化报告\n"
-            "  [cyan]history[/cyan]      查看训练迭代历史\n"
-            "  [cyan]dataset list[/cyan] 列出所有可用数据集\n"
-            "  [cyan]dataset <名>[/cyan] 切换数据集\n"
-            "  [cyan]reset[/cyan]        清空训练历史\n"
-            "  [cyan]help[/cyan]         显示此帮助\n\n"
-            "[bold]直接输入问题即可开始诊断，例如:[/bold]\n"
-            "  「帮我对比所有模型」\n"
-            "  「模型过拟合怎么办」\n"
-            "  「分析特征重要性」",
-            title="📖 帮助",
-        ))
-
-    def _show_datasets(self):
-        table = Table(title="可用数据集")
-        table.add_column("名称", style="cyan")
-        table.add_column("描述")
-        table.add_column("类别数", justify="right")
-        table.add_column("难度", justify="center")
-        table.add_column("当前", justify="center")
-
-        for name, info in DATASET_INFO.items():
-            current = "✅" if name == self.dataset_name else ""
-            table.add_row(name, info["description"][:40] + "...", str(info["n_classes"]), info["difficulty"], current)
-        console.print(table)
-        console.print("[dim]用 'dataset <名称>' 切换，如: dataset breast_cancer[/dim]")
-
-    def _show_history(self):
-        if not self.engine.history:
-            console.print("[yellow]还没有训练记录[/yellow]")
-            return
-
-        table = Table(title=f"训练迭代历史 (数据集: {self.dataset_name})")
-        table.add_column("#", style="dim")
-        table.add_column("模型", style="cyan")
-        table.add_column("Accuracy", justify="right")
-        table.add_column("F1", justify="right", style="green")
-        table.add_column("Overfit Gap", justify="right")
-        table.add_column("耗时", justify="right")
-
-        best = self.engine.get_best_result()
-        for r in self.engine.history:
-            is_best = r.iteration == best.iteration if best else False
-            marker = " ⭐" if is_best else ""
-            table.add_row(
-                str(r.iteration), r.model_type + marker,
-                f"{r.accuracy:.4f}", f"{r.f1:.4f}",
-                f"{r.train_accuracy - r.accuracy:.4f}",
-                f"{r.duration_seconds:.3f}s",
-            )
-        console.print(table)
-
     def _agent_loop(self):
-        """单轮对话的 Agent 排查循环"""
+        """核心 Agent 循环 - ReAct + 策略记忆 + 目标驱动"""
         steps = 0
+
         while steps < self.max_steps_per_turn and not self.executor.is_finished:
             steps += 1
             console.rule(f"[dim]排查步骤 {steps}[/dim]")
+
+            # 每步前刷新 system prompt（策略记忆可能已更新）
+            self._rebuild_system_prompt()
 
             try:
                 response = self.client.chat.completions.create(
@@ -381,13 +343,39 @@ class InteractiveAgent:
                     result_data = json.loads(result_str)
                     self._display_tool_result(tool_name, result_data)
 
+                    # 记录策略（训练类工具）
+                    if tool_name in ("run_training", "run_deep_training"):
+                        metrics = result_data.get("metrics", {})
+                        f1 = metrics.get("f1_macro", 0)
+                        self.strategy.record(action=tool_name, params=tool_input, outcome_f1=f1)
+                        if self.goal:
+                            self.goal["attempts_used"] += 1
+
                     self.messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": result_str,
                     })
             else:
+                # 无工具调用
+                if self.goal and not self._check_goal() and self.goal["attempts_used"] < self.goal["max_attempts"]:
+                    # 目标未达成，继续推动
+                    self.messages.append({
+                        "role": "user",
+                        "content": f"目标尚未达成 ({self.goal['metric'].upper()} > {self.goal['target']})。"
+                                   f"当前最佳: {self.strategy.current_best_f1:.4f}。"
+                                   f"请尝试不同策略继续优化。\n"
+                                   f"策略记忆:\n{self.strategy.to_context_string()}",
+                    })
+                    continue
                 break
+
+        # 目标达成检查
+        if self.goal and self._check_goal() and not self.executor.is_finished:
+            console.print(Panel(
+                f"[bold green]🎯 目标达成！{self.goal['metric'].upper()} = {self.strategy.current_best_f1:.4f} > {self.goal['target']}[/bold green]",
+                title="Goal Achieved",
+            ))
 
         if self.executor.is_finished and self.executor.conclusion:
             console.print(Panel(
@@ -398,14 +386,51 @@ class InteractiveAgent:
             self.executor._finished = False
 
     def _display_tool_result(self, tool_name: str, result: dict):
-        """简洁展示工具结果"""
         if tool_name == "run_training":
             metrics = result.get("metrics", {})
             m = result.get("model_type", "?")
             f1 = metrics.get("f1_macro", 0)
             acc = metrics.get("test_accuracy", 0)
             gap = metrics.get("overfit_gap", 0)
-            console.print(f"    → {m}: F1={f1:.4f}, Acc={acc:.4f}, Overfit={gap:.4f}")
+            # 策略判定
+            verdict = ""
+            if self.strategy.records:
+                last = self.strategy.records[-1]
+                if last.verdict.value == "improved":
+                    verdict = " [green]✅ improved[/green]"
+                elif last.verdict.value == "regressed":
+                    verdict = " [red]❌ regressed[/red]"
+                else:
+                    verdict = " [dim]➡️ neutral[/dim]"
+            console.print(f"    → {m}: F1={f1:.4f}, Acc={acc:.4f}, Overfit={gap:.4f}{verdict}")
+
+        elif tool_name == "run_deep_training":
+            metrics = result.get("metrics", {})
+            proc = result.get("training_process", {})
+            loss = result.get("loss_trend", {})
+            f1 = metrics.get("f1_macro", 0)
+            acc = metrics.get("test_accuracy", 0)
+            gap = metrics.get("overfit_gap", 0)
+            epochs = proc.get("total_epochs", "?")
+            early = " (early stopped)" if proc.get("early_stopped") else ""
+            verdict = ""
+            if self.strategy.records:
+                last = self.strategy.records[-1]
+                if last.verdict.value == "improved":
+                    verdict = " [green]✅ improved[/green]"
+                elif last.verdict.value == "regressed":
+                    verdict = " [red]❌ regressed[/red]"
+                else:
+                    verdict = " [dim]➡️ neutral[/dim]"
+            console.print(f"    → DNN: F1={f1:.4f}, Acc={acc:.4f}, Overfit={gap:.4f}, {epochs}ep{early}{verdict}")
+            console.print(f"    → Loss: {loss.get('first_val_loss', '?')} → {loss.get('final_val_loss', '?')} (best={loss.get('best_val_loss', '?')})")
+
+        elif tool_name == "diagnose_current_state":
+            findings = result.get("findings", [])
+            for f in findings:
+                icon = {"severe": "🔴", "moderate": "🟡", "mild": "🟢", "info": "ℹ️"}.get(f["severity"], "•")
+                console.print(f"    {icon} [{f['issue']}] {f['detail']}")
+                console.print(f"      → {f['suggestion']}")
 
         elif tool_name == "run_cross_validation":
             m = result.get("model_type", "?")
@@ -415,16 +440,12 @@ class InteractiveAgent:
 
         elif tool_name == "analyze_feature_importance":
             top = result.get("top_features", [])[:5]
-            method = result.get("method", "")
             features_str = ", ".join(f"{f['feature']}({f['importance']:.3f})" for f in top)
             console.print(f"    → Top5: {features_str}")
 
         elif tool_name == "analyze_learning_curve":
             diag = result.get("diagnosis", {})
-            improving = diag.get("still_improving_with_more_data", False)
-            gap = diag.get("final_overfit_gap", 0)
-            symbol = "📈" if improving else "📉"
-            console.print(f"    → {symbol} {diag.get('suggestion', '')}, overfit_gap={gap:.4f}")
+            console.print(f"    → {diag.get('suggestion', '')}")
 
         elif tool_name == "analyze_bad_cases":
             n = result.get("total_errors", 0)
@@ -440,28 +461,11 @@ class InteractiveAgent:
                     parts.append(f"{metric}: {info['before']}→{info['after']} {symbol}")
             console.print(f"    → {', '.join(parts)}")
 
-        elif tool_name == "run_deep_training":
-            metrics = result.get("metrics", {})
-            proc = result.get("training_process", {})
-            loss = result.get("loss_trend", {})
-            f1 = metrics.get("f1_macro", 0)
-            acc = metrics.get("test_accuracy", 0)
-            gap = metrics.get("overfit_gap", 0)
-            epochs = proc.get("total_epochs", "?")
-            early = " (early stopped)" if proc.get("early_stopped") else ""
-            console.print(f"    → DNN: F1={f1:.4f}, Acc={acc:.4f}, Overfit={gap:.4f}, {epochs} epochs{early}")
-            console.print(f"    → Loss: {loss.get('first_val_loss', '?')} → {loss.get('final_val_loss', '?')} (best={loss.get('best_val_loss', '?')})")
-
-        elif tool_name == "get_deep_training_history":
-            n = result.get("total_iterations", 0)
-            best_f1 = result.get("best_f1", 0)
-            console.print(f"    → {n} 次深度训练, 最佳 F1={best_f1}")
+        elif tool_name == "clean_noisy_data":
+            console.print(f"    → 移除 {result.get('train_samples_removed', 0)} 个样本")
 
         elif tool_name == "augment_data":
             console.print(f"    → {result.get('message', '')}")
-
-        elif tool_name == "clean_noisy_data":
-            console.print(f"    → 移除 {result.get('train_samples_removed', 0)} 个样本")
 
         elif tool_name == "generate_report":
             files = result.get("files", [])
@@ -469,7 +473,7 @@ class InteractiveAgent:
 
         elif tool_name == "get_data_summary":
             d = result
-            console.print(f"    → {d.get('dataset')}: {d.get('n_train')} 训练, {d.get('n_features')} 特征, {d.get('n_classes')} 类, 难度: {d.get('difficulty', '?')}")
+            console.print(f"    → {d.get('dataset')}: {d.get('n_train')} 训练, {d.get('n_features')} 特征, {d.get('n_classes')} 类, {d.get('difficulty', '?')}")
 
         elif tool_name == "finish":
             pass
@@ -480,15 +484,116 @@ class InteractiveAgent:
                 text = text[:200] + "..."
             console.print(f"    → {text}")
 
-    def _generate_final_report(self):
-        """生成可视化报告"""
-        if not self.engine.history:
-            console.print("[yellow]还没有训练记录，无法生成报告[/yellow]")
-            return
+    def _show_welcome(self):
+        ds_info = DATASET_INFO[self.dataset_name]
+        examples = [
+            "帮我训练一个分类模型并优化到最佳",
+            "帮我把 F1 优化到 0.85 以上",
+            "模型过拟合严重怎么办",
+            "帮我分析哪些特征最重要",
+            "帮我对比所有模型的表现",
+        ]
+        example_text = "\n".join(f"  [yellow]>[/yellow] {e}" for e in examples)
+        goal_text = ""
+        if self.goal:
+            goal_text = f"\n[bold yellow]🎯 目标模式: {self.goal['metric'].upper()} > {self.goal['target']}[/bold yellow]\n"
 
+        console.print(Panel(
+            f"[bold green]交互式训练诊断 Agent v3[/bold green]\n"
+            f"数据集: [cyan]{self.dataset_name}[/cyan] - {ds_info['name']}\n"
+            f"  {ds_info['description']}\n"
+            f"LLM: {self.model}{goal_text}\n\n"
+            f"[bold]核心特性:[/bold]\n"
+            f"  🧠 ReAct 推理框架 (假设→实验→验证)\n"
+            f"  📝 策略记忆 (追踪有效/失败的配置)\n"
+            f"  🔍 自动诊断 (一键检测所有问题)\n"
+            f"  🎯 目标驱动 (设定目标自主迭代)\n\n"
+            f"[bold]示例:[/bold]\n{example_text}\n\n"
+            f"[dim]命令: quit | report | history | strategy | dataset <name> | reset | help[/dim]",
+            title="🩺 Training Diagnostics Agent v3",
+            border_style="green",
+        ))
+
+    def _show_help(self):
+        console.print(Panel(
+            "[bold]可用命令:[/bold]\n"
+            "  [cyan]quit[/cyan]         退出\n"
+            "  [cyan]report[/cyan]       生成可视化报告\n"
+            "  [cyan]history[/cyan]      查看训练历史\n"
+            "  [cyan]strategy[/cyan]     查看策略记忆\n"
+            "  [cyan]dataset list[/cyan] 列出数据集\n"
+            "  [cyan]dataset <名>[/cyan] 切换数据集\n"
+            "  [cyan]reset[/cyan]        清空所有状态\n\n"
+            "[bold]目标模式:[/bold]\n"
+            "  输入包含 'F1 > 0.85' 等目标，Agent 会自主迭代直到达成。",
+            title="📖 帮助",
+        ))
+
+    def _show_strategy(self):
+        if not self.strategy.records:
+            console.print("[yellow]还没有策略记录[/yellow]")
+            return
+        table = Table(title="策略记忆")
+        table.add_column("#", style="dim")
+        table.add_column("操作", style="cyan")
+        table.add_column("配置")
+        table.add_column("F1", justify="right", style="green")
+        table.add_column("Δ", justify="right")
+        table.add_column("判定", justify="center")
+
+        for r in self.strategy.records:
+            verdict_icon = {"improved": "✅", "neutral": "➡️", "regressed": "❌"}[r.verdict.value]
+            table.add_row(
+                str(r.step), r.action.replace("run_", ""),
+                r.params_summary[:40], f"{r.outcome_f1:.4f}",
+                f"{r.delta:+.4f}", verdict_icon,
+            )
+        console.print(table)
+        console.print(f"[bold]当前最佳 F1: {self.strategy.current_best_f1:.4f}[/bold]")
+
+    def _show_history(self):
+        if not self.engine.history:
+            console.print("[yellow]还没有训练记录[/yellow]")
+            return
+        table = Table(title=f"训练迭代历史 (数据集: {self.dataset_name})")
+        table.add_column("#", style="dim")
+        table.add_column("模型", style="cyan")
+        table.add_column("Accuracy", justify="right")
+        table.add_column("F1", justify="right", style="green")
+        table.add_column("Overfit Gap", justify="right")
+        table.add_column("耗时", justify="right")
+
+        best = self.engine.get_best_result()
+        for r in self.engine.history:
+            is_best = r.iteration == best.iteration if best else False
+            marker = " ⭐" if is_best else ""
+            table.add_row(
+                str(r.iteration), r.model_type + marker,
+                f"{r.accuracy:.4f}", f"{r.f1:.4f}",
+                f"{r.train_accuracy - r.accuracy:.4f}",
+                f"{r.duration_seconds:.3f}s",
+            )
+        console.print(table)
+
+    def _show_datasets(self):
+        table = Table(title="可用数据集")
+        table.add_column("名称", style="cyan")
+        table.add_column("描述")
+        table.add_column("类别", justify="right")
+        table.add_column("难度", justify="center")
+        table.add_column("当前", justify="center")
+
+        for name, info in DATASET_INFO.items():
+            current = "✅" if name == self.dataset_name else ""
+            table.add_row(name, info["description"][:40] + "...", str(info["n_classes"]), info["difficulty"], current)
+        console.print(table)
+
+    def _generate_final_report(self):
+        if not self.engine.history:
+            console.print("[yellow]还没有训练记录[/yellow]")
+            return
         paths = generate_all_plots(
-            self.engine,
-            self.dataset.target_names,
+            self.engine, self.dataset.target_names,
             feature_importances=self.executor._feature_importances,
             learning_curve_data=self.executor._learning_curve_data,
             deep_engine=self.deep_engine,
@@ -499,3 +604,5 @@ class InteractiveAgent:
             border_style="green",
         ))
         self._show_history()
+        if self.strategy.records:
+            self._show_strategy()

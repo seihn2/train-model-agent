@@ -203,6 +203,18 @@ OPENAI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "diagnose_current_state",
+            "description": "自动诊断当前训练状态，一次性检测所有潜在问题：过拟合/欠拟合、类别不平衡、性能瓶颈、特定类别薄弱、训练是否收敛等。返回结构化的诊断报告和改进建议。建议在每次重要训练后调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_deep_training",
             "description": "使用 PyTorch 深度神经网络进行训练。可以配置网络结构（层数、宽度、dropout、激活函数、BatchNorm）、优化器（Adam/AdamW/SGD）、学习率调度（cosine/step/plateau）、早停等。返回完整的训练过程日志（每个 epoch 的 loss 和指标变化）。适合需要更强模型能力或需要观察训练动态的场景。",
             "parameters": {

@@ -50,6 +50,11 @@ def main():
         default="https://coding.dashscope.aliyuncs.com/v1",
         help="API base URL",
     )
+    parser.add_argument(
+        "--goal",
+        default=None,
+        help="设定优化目标，如 'F1>0.85'，Agent 会自主迭代直到达成",
+    )
     args = parser.parse_args()
 
     if args.mode == "auto":
@@ -81,6 +86,7 @@ def main():
             model=args.model,
             api_key=args.api_key,
             base_url=args.base_url,
+            goal=args.goal,
         )
         agent.run()
 

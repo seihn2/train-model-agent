@@ -44,6 +44,7 @@ class ToolExecutor:
             "analyze_bad_cases": self._analyze_bad_cases,
             "compare_iterations": self._compare_iterations,
             "clean_noisy_data": self._clean_noisy_data,
+            "diagnose_current_state": self._diagnose_current_state,
             "run_deep_training": self._run_deep_training,
             "get_deep_training_history": self._get_deep_training_history,
             "augment_data": self._augment_data,
@@ -392,6 +393,101 @@ class ToolExecutor:
             "train_size_before": n_before,
             "train_size_after": len(self.dataset.y_train),
             "message": f"已移除 {removed} 个可疑训练样本。建议重新训练观察效果。",
+        }
+
+    def _diagnose_current_state(self, _input: dict) -> dict:
+        """自动诊断当前训练状态，检测所有潜在问题"""
+        if not self.engine.history:
+            return {
+                "status": "no_training",
+                "findings": [{"issue": "no_training", "severity": "info", "detail": "还没有训练记录", "suggestion": "请先用 run_training 或 run_deep_training 训练一个基线模型"}],
+                "summary": "尚未开始训练，请先建立基线",
+            }
+
+        findings = []
+        latest = self.engine.history[-1]
+        best = self.engine.get_best_result()
+
+        # 1. 过拟合检测
+        overfit_gap = latest.train_accuracy - latest.accuracy
+        if overfit_gap > 0.20:
+            findings.append({"issue": "overfit", "severity": "severe", "detail": f"Train-test gap = {overfit_gap:.2%}，模型严重过拟合", "suggestion": "增加正则化(dropout/weight_decay)、减小模型复杂度、或增加训练数据"})
+        elif overfit_gap > 0.10:
+            findings.append({"issue": "overfit", "severity": "moderate", "detail": f"Train-test gap = {overfit_gap:.2%}", "suggestion": "适当增加正则化或减小模型规模"})
+        elif overfit_gap > 0.05:
+            findings.append({"issue": "overfit", "severity": "mild", "detail": f"Train-test gap = {overfit_gap:.2%}，轻微过拟合", "suggestion": "可尝试微调正则化参数"})
+
+        # 2. 欠拟合检测
+        if latest.accuracy < 0.65 and latest.train_accuracy < 0.75:
+            findings.append({"issue": "underfit", "severity": "severe", "detail": f"Train acc={latest.train_accuracy:.2%}, Test acc={latest.accuracy:.2%}，模型欠拟合", "suggestion": "增大模型容量、增加训练轮数、或降低正则化强度"})
+        elif latest.accuracy < 0.70:
+            findings.append({"issue": "underfit", "severity": "moderate", "detail": f"Test acc={latest.accuracy:.2%}，性能偏低", "suggestion": "尝试更复杂的模型或深度学习"})
+
+        # 3. 类别不平衡检测
+        summary = self.dataset.get_data_summary()
+        class_dist = summary["class_distribution"]
+        counts = list(class_dist.values())
+        if counts:
+            max_count = max(counts)
+            min_count = min(counts)
+            ratio = min_count / max_count
+            if ratio < 0.5:
+                minority = [k for k, v in class_dist.items() if v == min_count]
+                findings.append({"issue": "class_imbalance", "severity": "moderate", "detail": f"最少类({minority[0]})仅有最多类的 {ratio:.0%} 样本", "suggestion": "使用 augment_data(method='oversample') 进行过采样"})
+
+        # 4. 特定类别薄弱检测
+        report = latest.per_class_report
+        if report:
+            for line in report.strip().split("\n"):
+                parts = line.split()
+                if len(parts) >= 5 and parts[0] not in ("precision", "accuracy", "macro", "weighted", ""):
+                    try:
+                        recall = float(parts[2])
+                        class_name = parts[0]
+                        if recall < 0.60:
+                            findings.append({"issue": "weak_class", "severity": "moderate", "detail": f"类别 '{class_name}' 召回率仅 {recall:.0%}", "suggestion": f"分析该类别的 bad cases，可能需要数据增强或特征工程"})
+                    except (ValueError, IndexError):
+                        pass
+
+        # 5. 训练瓶颈/收敛检测
+        if len(self.engine.history) >= 3:
+            recent_f1 = [r.f1 for r in self.engine.history[-3:]]
+            f1_range = max(recent_f1) - min(recent_f1)
+            if f1_range < 0.005:
+                findings.append({"issue": "plateau", "severity": "info", "detail": f"最近 3 次训练 F1 波动仅 {f1_range:.4f}，已收敛", "suggestion": "尝试完全不同的模型类型、数据增强、或接受当前结果"})
+
+        # 6. 噪声标签嫌疑
+        if latest.prediction_probas is not None:
+            y_test = self.dataset.y_test
+            y_pred = latest.predictions
+            y_proba = latest.prediction_probas
+            wrong = y_pred != y_test
+            if wrong.sum() > 0:
+                wrong_conf = y_proba[wrong].max(axis=1)
+                high_conf_wrong = (wrong_conf > 0.9).sum()
+                if high_conf_wrong > 3:
+                    findings.append({"issue": "noisy_labels", "severity": "mild", "detail": f"{int(high_conf_wrong)} 个样本被高置信度(>90%)错误预测，可能是噪声标签", "suggestion": "尝试 clean_noisy_data 清洗数据"})
+
+        # 没有问题
+        if not findings:
+            findings.append({"issue": "healthy", "severity": "info", "detail": "未发现明显问题", "suggestion": "当前模型状态良好，可以尝试微调或接受结果"})
+
+        return {
+            "findings": findings,
+            "current_best": {
+                "model": best.model_type if best else None,
+                "f1": round(best.f1, 4) if best else None,
+                "iteration": best.iteration if best else None,
+                "accuracy": round(best.accuracy, 4) if best else None,
+            },
+            "latest_metrics": {
+                "model": latest.model_type,
+                "f1": round(latest.f1, 4),
+                "accuracy": round(latest.accuracy, 4),
+                "overfit_gap": round(overfit_gap, 4),
+            },
+            "total_iterations": len(self.engine.history),
+            "summary": f"检测到 {len([f for f in findings if f['severity'] != 'info'])} 个问题" if findings else "状态良好",
         }
 
     def _run_deep_training(self, _input: dict) -> dict:
