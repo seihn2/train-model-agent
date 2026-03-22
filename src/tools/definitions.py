@@ -203,6 +203,114 @@ OPENAI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "run_deep_training",
+            "description": "使用 PyTorch 深度神经网络进行训练。可以配置网络结构（层数、宽度、dropout、激活函数、BatchNorm）、优化器（Adam/AdamW/SGD）、学习率调度（cosine/step/plateau）、早停等。返回完整的训练过程日志（每个 epoch 的 loss 和指标变化）。适合需要更强模型能力或需要观察训练动态的场景。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "preset": {
+                        "type": "string",
+                        "description": "预设网络架构: small(64-32), medium(128-64), large(256-128-64), wide(256-256), deep(128-128-64-32), gelu_net(128-64+GELU)。使用预设时其他网络参数将被忽略。",
+                        "enum": ["small", "medium", "large", "wide", "deep", "gelu_net"],
+                    },
+                    "hidden_layers": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "自定义隐藏层宽度列表，如 [256, 128, 64]",
+                    },
+                    "dropout": {
+                        "type": "number",
+                        "description": "Dropout 率 (0.0-0.5)，默认 0.2",
+                    },
+                    "activation": {
+                        "type": "string",
+                        "description": "激活函数",
+                        "enum": ["relu", "tanh", "leaky_relu", "gelu"],
+                    },
+                    "batch_norm": {
+                        "type": "boolean",
+                        "description": "是否使用 BatchNorm，默认 true",
+                    },
+                    "n_epochs": {
+                        "type": "integer",
+                        "description": "最大训练轮数，默认 100",
+                    },
+                    "batch_size": {
+                        "type": "integer",
+                        "description": "批大小，默认 32",
+                    },
+                    "learning_rate": {
+                        "type": "number",
+                        "description": "学习率，默认 0.001",
+                    },
+                    "weight_decay": {
+                        "type": "number",
+                        "description": "权重衰减(L2正则化)，默认 1e-4",
+                    },
+                    "optimizer": {
+                        "type": "string",
+                        "description": "优化器类型",
+                        "enum": ["adam", "adamw", "sgd"],
+                    },
+                    "lr_scheduler": {
+                        "type": "string",
+                        "description": "学习率调度策略",
+                        "enum": ["none", "cosine", "step", "plateau"],
+                    },
+                    "early_stopping": {
+                        "type": "boolean",
+                        "description": "是否启用早停，默认 true",
+                    },
+                    "patience": {
+                        "type": "integer",
+                        "description": "早停耐心值，默认 15",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_deep_training_history",
+            "description": "获取深度学习训练的历史记录，包括每次训练的网络配置、训练过程(loss曲线)和最终指标。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "augment_data",
+            "description": "对训练数据进行增强。支持: 过采样少数类(SMOTE-like)、添加高斯噪声、特征组合。用于解决类别不平衡或数据量不足的问题。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "增强方法",
+                        "enum": ["oversample", "noise", "both"],
+                    },
+                    "noise_std": {
+                        "type": "number",
+                        "description": "高斯噪声标准差(仅noise/both时有效)，默认 0.1",
+                    },
+                    "oversample_ratio": {
+                        "type": "number",
+                        "description": "过采样到多数类的比例(仅oversample/both时有效)，默认 1.0(完全平衡)",
+                    },
+                },
+                "required": ["method"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generate_report",
             "description": "生成可视化训练报告，包括：指标趋势图、模型对比图、混淆矩阵热力图、超参数影响图、特征重要性图、学习曲线图。图表保存到 reports/ 目录。",
             "parameters": {

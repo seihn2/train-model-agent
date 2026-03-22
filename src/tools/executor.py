@@ -6,18 +6,19 @@ from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.inspection import permutation_importance
 from ..dataset import DatasetManager
 from ..trainer import TrainingEngine, MODEL_REGISTRY, HYPERPARAM_SPECS
+from ..deep_trainer import DeepTrainingEngine, ARCHITECTURE_PRESETS
 from ..visualizer import generate_all_plots
 
 
 class ToolExecutor:
     """执行 Agent 的工具调用，维护状态"""
 
-    def __init__(self, dataset: DatasetManager, engine: TrainingEngine):
+    def __init__(self, dataset: DatasetManager, engine: TrainingEngine, deep_engine: DeepTrainingEngine | None = None):
         self.dataset = dataset
         self.engine = engine
+        self.deep_engine = deep_engine or DeepTrainingEngine()
         self._finished = False
         self._conclusion = ""
-        # 存储最近一次训练的模型实例（用于特征重要性分析）
         self._last_model = None
         self._feature_importances: list[dict] | None = None
         self._learning_curve_data: dict | None = None
@@ -43,6 +44,9 @@ class ToolExecutor:
             "analyze_bad_cases": self._analyze_bad_cases,
             "compare_iterations": self._compare_iterations,
             "clean_noisy_data": self._clean_noisy_data,
+            "run_deep_training": self._run_deep_training,
+            "get_deep_training_history": self._get_deep_training_history,
+            "augment_data": self._augment_data,
             "generate_report": self._generate_report,
             "finish": self._finish,
         }
@@ -390,14 +394,141 @@ class ToolExecutor:
             "message": f"已移除 {removed} 个可疑训练样本。建议重新训练观察效果。",
         }
 
+    def _run_deep_training(self, _input: dict) -> dict:
+        # 预设架构
+        preset = _input.get("preset")
+        if preset and preset in ARCHITECTURE_PRESETS:
+            net_config = dict(ARCHITECTURE_PRESETS[preset])
+        else:
+            net_config = {
+                "hidden_layers": _input.get("hidden_layers", [128, 64]),
+                "dropout": _input.get("dropout", 0.2),
+                "activation": _input.get("activation", "relu"),
+                "batch_norm": _input.get("batch_norm", True),
+            }
+
+        result = self.deep_engine.train(
+            X_train=self.dataset.X_train,
+            y_train=self.dataset.y_train,
+            X_test=self.dataset.X_test,
+            y_test=self.dataset.y_test,
+            target_names=self.dataset.target_names,
+            hidden_layers=net_config["hidden_layers"],
+            dropout=net_config["dropout"],
+            activation=net_config["activation"],
+            batch_norm=net_config["batch_norm"],
+            n_epochs=_input.get("n_epochs", 100),
+            batch_size=_input.get("batch_size", 32),
+            learning_rate=_input.get("learning_rate", 0.001),
+            weight_decay=_input.get("weight_decay", 1e-4),
+            optimizer_type=_input.get("optimizer", "adam"),
+            lr_scheduler=_input.get("lr_scheduler", "none"),
+            early_stopping=_input.get("early_stopping", True),
+            patience=_input.get("patience", 15),
+        )
+
+        # 同步到 sklearn engine 的 history 以便统一对比
+        from ..trainer import TrainResult
+        sklearn_result = TrainResult(
+            iteration=len(self.engine.history) + 1,
+            model_type=f"dnn_{preset or 'custom'}",
+            hyperparameters={**net_config, "lr": _input.get("learning_rate", 0.001),
+                           "optimizer": _input.get("optimizer", "adam"),
+                           "epochs_run": result.n_epochs_run},
+            accuracy=result.accuracy,
+            precision=result.precision,
+            recall=result.recall,
+            f1=result.f1,
+            confusion_matrix=result.confusion_matrix,
+            per_class_report=result.per_class_report,
+            train_accuracy=result.train_accuracy,
+            duration_seconds=result.duration_seconds,
+            predictions=result.predictions,
+            prediction_probas=result.prediction_probas,
+        )
+        self.engine.history.append(sklearn_result)
+
+        return result.to_summary()
+
+    def _get_deep_training_history(self, _input: dict) -> dict:
+        if not self.deep_engine.history:
+            return {"message": "还没有深度学习训练记录，请先调用 run_deep_training"}
+        history = self.deep_engine.get_history_summary()
+        best = self.deep_engine.get_best_result()
+        return {
+            "total_iterations": len(history),
+            "history": history,
+            "best_iteration": best.iteration if best else None,
+            "best_f1": round(best.f1, 4) if best else None,
+        }
+
+    def _augment_data(self, _input: dict) -> dict:
+        method = _input.get("method", "oversample")
+        noise_std = _input.get("noise_std", 0.1)
+        oversample_ratio = _input.get("oversample_ratio", 1.0)
+
+        original_size = len(self.dataset.y_train)
+        X = self.dataset.X_train
+        y = self.dataset.y_train
+
+        added_samples = 0
+
+        if method in ("oversample", "both"):
+            # 过采样少数类
+            unique, counts = np.unique(y, return_counts=True)
+            max_count = int(max(counts) * oversample_ratio)
+            new_X_parts = [X]
+            new_y_parts = [y]
+
+            for cls, cnt in zip(unique, counts):
+                if cnt < max_count:
+                    cls_indices = np.where(y == cls)[0]
+                    n_needed = max_count - cnt
+                    # 随机重采样 + 轻微扰动
+                    chosen = np.random.choice(cls_indices, size=n_needed, replace=True)
+                    new_samples = X[chosen] + np.random.normal(0, 0.05, (n_needed, X.shape[1]))
+                    new_X_parts.append(new_samples)
+                    new_y_parts.append(np.full(n_needed, cls))
+                    added_samples += n_needed
+
+            X = np.vstack(new_X_parts)
+            y = np.concatenate(new_y_parts)
+
+        if method in ("noise", "both"):
+            # 给现有样本加噪声副本
+            n_noise = len(y) // 5  # 增加 20% 的噪声样本
+            indices = np.random.choice(len(y), size=n_noise, replace=True)
+            noise_X = X[indices] + np.random.normal(0, noise_std, (n_noise, X.shape[1]))
+            noise_y = y[indices]
+            X = np.vstack([X, noise_X])
+            y = np.concatenate([y, noise_y])
+            added_samples += n_noise
+
+        self.dataset.X_train = X
+        self.dataset.y_train = y
+
+        # 新的类别分布
+        unique, counts = np.unique(y, return_counts=True)
+        new_dist = {self.dataset.target_names[int(c)]: int(n) for c, n in zip(unique, counts)}
+
+        return {
+            "method": method,
+            "original_size": original_size,
+            "new_size": len(y),
+            "added_samples": added_samples,
+            "class_distribution": new_dist,
+            "message": f"数据增强完成: {original_size} → {len(y)} 样本 (+{added_samples})",
+        }
+
     def _generate_report(self, _input: dict) -> dict:
-        if not self.engine.history:
+        if not self.engine.history and not self.deep_engine.history:
             return {"error": "还没有训练记录，请先训练"}
         paths = generate_all_plots(
             self.engine,
             self.dataset.target_names,
             feature_importances=self._feature_importances,
             learning_curve_data=self._learning_curve_data,
+            deep_engine=self.deep_engine,
         )
         return {
             "message": f"已生成 {len(paths)} 张可视化图表",

@@ -276,11 +276,69 @@ def plot_learning_curve(learning_curve_data: dict) -> str:
     return path
 
 
+def plot_deep_training_curves(deep_results: list) -> str:
+    """绘制深度学习训练的 loss/accuracy 曲线"""
+    _ensure_output_dir()
+    if not deep_results:
+        return ""
+
+    # 取最近 4 个结果绘制
+    results = deep_results[-4:]
+    n = len(results)
+
+    fig, axes = plt.subplots(n, 2, figsize=(14, 4 * n), squeeze=False)
+
+    for i, r in enumerate(results):
+        logs = r.epoch_logs
+        if not logs:
+            continue
+        epochs = [e.epoch for e in logs]
+        train_loss = [e.train_loss for e in logs]
+        val_loss = [e.val_loss for e in logs]
+        train_acc = [e.train_accuracy for e in logs]
+        val_acc = [e.val_accuracy for e in logs]
+
+        cfg = r.network_config
+        title = f"iter{r.iteration} | {cfg['hidden_layers']} drop={cfg['dropout']} {cfg['activation']}"
+
+        # Loss 曲线
+        ax_l = axes[i][0]
+        ax_l.plot(epochs, train_loss, label="Train Loss", linewidth=1.5, color="red")
+        ax_l.plot(epochs, val_loss, label="Val Loss", linewidth=1.5, color="blue")
+        if r.early_stopped:
+            ax_l.axvline(x=r.early_stop_epoch, color="gray", linestyle="--", alpha=0.7, label=f"Early Stop @ {r.early_stop_epoch}")
+        best_epoch = min(range(len(logs)), key=lambda j: logs[j].val_loss)
+        ax_l.scatter([logs[best_epoch].epoch], [logs[best_epoch].val_loss], c="gold", s=100, marker="*", zorder=5, label=f"Best Val Loss")
+        ax_l.set_xlabel("Epoch")
+        ax_l.set_ylabel("Loss")
+        ax_l.set_title(f"Loss - {title}")
+        ax_l.legend(fontsize=7)
+        ax_l.grid(True, alpha=0.3)
+
+        # Accuracy 曲线
+        ax_a = axes[i][1]
+        ax_a.plot(epochs, train_acc, label="Train Acc", linewidth=1.5, color="red")
+        ax_a.plot(epochs, val_acc, label="Val Acc", linewidth=1.5, color="blue")
+        ax_a.fill_between(epochs, val_acc, train_acc, alpha=0.1, color="red")
+        ax_a.set_xlabel("Epoch")
+        ax_a.set_ylabel("Accuracy")
+        ax_a.set_title(f"Accuracy - F1={r.f1:.4f}")
+        ax_a.legend(fontsize=7)
+        ax_a.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(OUTPUT_DIR, "deep_training_curves.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def generate_all_plots(
     engine: TrainingEngine,
     target_names: list[str] | None = None,
     feature_importances: list[dict] | None = None,
     learning_curve_data: dict | None = None,
+    deep_engine=None,
 ) -> list[str]:
     """生成所有可视化图表"""
     paths = []
@@ -302,6 +360,11 @@ def generate_all_plots(
 
     if learning_curve_data:
         path = plot_learning_curve(learning_curve_data)
+        if path:
+            paths.append(path)
+
+    if deep_engine and deep_engine.history:
+        path = plot_deep_training_curves(deep_engine.history)
         if path:
             paths.append(path)
 

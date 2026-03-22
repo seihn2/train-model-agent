@@ -23,6 +23,7 @@ from rich.columns import Columns
 
 from .dataset import DatasetManager, DATASET_INFO
 from .trainer import TrainingEngine
+from .deep_trainer import DeepTrainingEngine
 from .tools.definitions import OPENAI_TOOLS
 from .tools.executor import ToolExecutor
 from .visualizer import generate_all_plots
@@ -53,17 +54,28 @@ INTERACTIVE_SYSTEM_PROMPT = """你是一个专业的机器学习训练诊断 Age
 
 ## 你拥有的工具
 
+### 传统 ML
 - get_data_summary: 了解数据集基本信息
-- get_available_models: 查看可用模型和参数
-- run_training: 训练模型
-- run_cross_validation: 交叉验证（更稳健的评估）
+- get_available_models: 查看可用 sklearn 模型和参数
+- run_training: 训练 sklearn 模型
+- run_cross_validation: 交叉验证
+
+### 深度学习 (PyTorch)
+- run_deep_training: 训练自定义深度神经网络，可配置网络结构/优化器/学习率调度/早停，返回完整 epoch 级别训练日志
+- get_deep_training_history: 查看深度学习训练历史
+
+### 分析诊断
 - analyze_feature_importance: 特征重要性分析
-- analyze_learning_curve: 学习曲线分析（诊断数据量是否足够、过拟合/欠拟合）
-- get_training_history: 查看训练历史
+- analyze_learning_curve: 学习曲线分析
 - analyze_bad_cases: 分析错误样本
-- compare_iterations: 对比两次训练
+- compare_iterations: 对比两次训练（sklearn 和深度学习结果统一编号，可以跨模型对比）
+
+### 数据操作
 - clean_noisy_data: 清洗噪声数据
-- generate_report: 生成可视化报告
+- augment_data: 数据增强（过采样/加噪声）
+
+### 报告
+- generate_report: 生成可视化报告（含深度学习 loss 曲线）
 - finish: 输出最终结论
 
 ## 常见问题排查模板
@@ -88,6 +100,17 @@ INTERACTIVE_SYSTEM_PROMPT = """你是一个专业的机器学习训练诊断 Age
 
 ### 数据量是否足够
 1. analyze_learning_curve → 看曲线是否收敛
+
+### 需要更强模型
+1. 先用 sklearn 模型建基线
+2. run_deep_training(preset="medium") → 深度网络
+3. 根据 loss 曲线调整: 过拟合→加dropout/减网络、欠拟合→加宽加深
+4. 尝试不同 optimizer/scheduler
+
+### 类别不平衡
+1. get_data_summary → 看分布
+2. augment_data(method="oversample") → 过采样少数类
+3. 重新训练对比
 
 ## 输出要求
 
@@ -116,7 +139,8 @@ class InteractiveAgent:
         self.dataset_name = dataset_name
         self.dataset = DatasetManager(dataset_name=dataset_name)
         self.engine = TrainingEngine()
-        self.executor = ToolExecutor(self.dataset, self.engine)
+        self.deep_engine = DeepTrainingEngine()
+        self.executor = ToolExecutor(self.dataset, self.engine, self.deep_engine)
         self.max_steps_per_turn = max_steps_per_turn
         self.model = model
         self.api_key = api_key
@@ -131,7 +155,8 @@ class InteractiveAgent:
         self.dataset_name = name
         self.dataset = DatasetManager(dataset_name=name)
         self.engine = TrainingEngine()
-        self.executor = ToolExecutor(self.dataset, self.engine)
+        self.deep_engine = DeepTrainingEngine()
+        self.executor = ToolExecutor(self.dataset, self.engine, self.deep_engine)
         # 保留对话历史但添加切换通知
         self.messages.append({
             "role": "user",
@@ -205,7 +230,8 @@ class InteractiveAgent:
 
             if cmd == "reset":
                 self.engine = TrainingEngine()
-                self.executor = ToolExecutor(self.dataset, self.engine)
+                self.deep_engine = DeepTrainingEngine()
+                self.executor = ToolExecutor(self.dataset, self.engine, self.deep_engine)
                 console.print("[yellow]训练历史已清空[/yellow]")
                 continue
 
@@ -414,6 +440,26 @@ class InteractiveAgent:
                     parts.append(f"{metric}: {info['before']}→{info['after']} {symbol}")
             console.print(f"    → {', '.join(parts)}")
 
+        elif tool_name == "run_deep_training":
+            metrics = result.get("metrics", {})
+            proc = result.get("training_process", {})
+            loss = result.get("loss_trend", {})
+            f1 = metrics.get("f1_macro", 0)
+            acc = metrics.get("test_accuracy", 0)
+            gap = metrics.get("overfit_gap", 0)
+            epochs = proc.get("total_epochs", "?")
+            early = " (early stopped)" if proc.get("early_stopped") else ""
+            console.print(f"    → DNN: F1={f1:.4f}, Acc={acc:.4f}, Overfit={gap:.4f}, {epochs} epochs{early}")
+            console.print(f"    → Loss: {loss.get('first_val_loss', '?')} → {loss.get('final_val_loss', '?')} (best={loss.get('best_val_loss', '?')})")
+
+        elif tool_name == "get_deep_training_history":
+            n = result.get("total_iterations", 0)
+            best_f1 = result.get("best_f1", 0)
+            console.print(f"    → {n} 次深度训练, 最佳 F1={best_f1}")
+
+        elif tool_name == "augment_data":
+            console.print(f"    → {result.get('message', '')}")
+
         elif tool_name == "clean_noisy_data":
             console.print(f"    → 移除 {result.get('train_samples_removed', 0)} 个样本")
 
@@ -445,6 +491,7 @@ class InteractiveAgent:
             self.dataset.target_names,
             feature_importances=self.executor._feature_importances,
             learning_curve_data=self.executor._learning_curve_data,
+            deep_engine=self.deep_engine,
         )
         console.print(Panel(
             "\n".join(f"  📊 {p}" for p in paths),
