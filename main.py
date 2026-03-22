@@ -12,12 +12,25 @@
   uv run python main.py --mode interactive               # 单 Agent 模式
   uv run python main.py --mode auto                      # 全自动
   uv run python main.py --mode rule                      # 规则引擎
+
+配置:
+  复制 .env.example 为 .env 并填入你的 API key:
+    cp .env.example .env
 """
 
 import argparse
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def main():
+    # 从 .env 读取默认值
+    default_api_key = os.getenv("LLM_API_KEY", "")
+    default_base_url = os.getenv("LLM_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1")
+    default_model = os.getenv("LLM_MODEL", "qwen3.5-plus")
+
     parser = argparse.ArgumentParser(description="训练模型 Agent - 自动化 ML 训练迭代")
     parser.add_argument(
         "--mode",
@@ -35,11 +48,18 @@ def main():
         "--max-iterations", type=int, default=15,
         help="最大迭代步数 (default: 15)",
     )
-    parser.add_argument("--model", default="qwen3.5-plus", help="LLM 模型")
-    parser.add_argument("--api-key", default="sk-sp-757cfc1938734d8989a31d8c35bd05cc")
-    parser.add_argument("--base-url", default="https://coding.dashscope.aliyuncs.com/v1")
+    parser.add_argument("--model", default=default_model, help="LLM 模型")
+    parser.add_argument("--api-key", default=default_api_key, help="API key (也可通过 .env 配置)")
+    parser.add_argument("--base-url", default=default_base_url, help="API base URL")
     parser.add_argument("--goal", default=None, help="优化目标, 如 'F1>0.85'")
     args = parser.parse_args()
+
+    if args.mode != "rule" and not args.api_key:
+        print("错误: 需要配置 API key")
+        print("  方式 1: 复制 .env.example 为 .env 并填入 LLM_API_KEY")
+        print("  方式 2: --api-key your-key")
+        print("  方式 3: 使用 --mode rule 运行规则引擎（无需 API）")
+        return
 
     if args.mode == "multi":
         from src.multi_agent import MultiAgentSystem
