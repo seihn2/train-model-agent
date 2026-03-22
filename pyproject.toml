@@ -1,0 +1,16 @@
+[project]
+name = "train-model-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.86.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.3",
+    "openai>=2.29.0",
+    "pandas>=3.0.1",
+    "rich>=14.3.3",
+    "scikit-learn>=1.8.0",
+    "tabulate>=0.10.0",
+]
